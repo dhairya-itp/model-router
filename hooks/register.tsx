@@ -41,6 +41,8 @@ const lastError = atom({ plugin: 'model-router', key: 'lastError' } as const, nu
 const cards = atom({ plugin: 'model-router', key: 'cards' } as const, [])
 const keyChecks = atom({ plugin: 'model-router', key: 'keyChecks' } as const, {})
 const keyVersion = atom({ plugin: 'model-router', key: 'keyVersion' } as const, 0)
+const panel = atom({ plugin: 'model-router', key: 'panel' } as const, 'closed')
+const keyEntry = atom({ plugin: 'model-router', key: 'keyEntry' } as const, null)
 
 /** The keys pane, and where the keys saved from it are kept: this plugin's own store. */
 const KEYS_PANE = 'router-keys'
@@ -497,6 +499,39 @@ async function chooseProvider($: EngineInterface, value: string): Promise<void> 
   if (row !== undefined) await $.config.set({ key: row.key, value })
 }
 
+/** One line about each effort level, for the panel. */
+const EFFORT_NOTES: Record<string, string> = {
+  low: 'obvious or mechanical work',
+  medium: 'some reasoning, one clear path',
+  high: 'several steps and trade-offs',
+  xhigh: 'long agentic work, tricky bugs',
+  max: 'very hard, correctness first',
+}
+
+/** Sets one part of the pin from the panel; the classifier picks whatever is left open. */
+async function setPinned($: EngineInterface, change: RouterPin): Promise<void> {
+  await update($, pin, current => {
+    const next: RouterPin = { ...(current ?? {}), ...change }
+    if (next.tier === undefined) delete next.tier
+    if (next.effort === undefined) delete next.effort
+    return next.tier === undefined && next.effort === undefined ? null : next
+  })
+}
+
+/** Saves a key typed in the panel and, once it is saved, makes its provider the classifier. */
+async function saveKeyAndUse($: EngineInterface, settings: Settings, slot: RouterKeySlot, provider: string, text: string): Promise<void> {
+  await saveKey($, settings, slot, text)
+  if ((await readSavedKeys($))[slot] === undefined) return
+  await update($, keyEntry, () => null)
+  await chooseProvider($, provider)
+}
+
+/** Ends the first-run welcome for good. */
+async function finishWelcome($: EngineInterface): Promise<void> {
+  await $.store.set('onboarded', true)
+  await update($, panel, () => 'closed')
+}
+
 /** Pauses or resumes routing, from the command or the band's button. */
 async function setPaused($: EngineInterface, paused: boolean): Promise<void> {
   await update($, isPaused, () => paused)
@@ -581,6 +616,7 @@ export const register: Register = (on, options) => {
       argumentHint: '[test <prompt> | pin <model> [effort] | unpin | on | off]',
     })
     $.ui.status(statusLine(await read($, route), await read($, isPaused)))
+    if ((await $.store.get('onboarded')) !== true) await update($, panel, () => 'welcome')
 
     return next(e)
   })
@@ -673,18 +709,146 @@ export const register: Register = (on, options) => {
     )
   })
 
-  // Always above the prompt (terminal and desktop): the pick in force, and the controls.
+  // Always above the prompt (terminal and desktop): one glowing row, or the panel in the style of Claude's own dialogs.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey) return next(e)
-    const [chosen, paused, pinned, classifier] = await Promise.all([read($, route), read($, isPaused), read($, pin), resolveClassifier($, settings)])
-    const view = bandView({ route: chosen, isPaused: paused, pin: pinned, classifier: classifierLabel(classifier.settings), isWorking: e.props.isWorking })
-    const { Box, Text, Button } = $.ui.resolve(e)
-    const controls = [
-      <Button key="router-toggle" label={paused ? 'Resume' : 'Pause'} variant={paused ? 'primary' : undefined} onPress={() => void setPaused($, !paused)} />,
-      <Button key="router-keys" label="Keys" onPress={() => void openKeys($)} />,
-      pinned !== null ? <Button key="router-unpin" label="Unpin" onPress={() => void update($, pin, () => null)} /> : null,
-    ]
+    if (e.props.hasSurvey || (e.surface !== 'terminal' && e.surface !== 'desktop')) return next(e)
+    const [chosen, paused, pinned, page, entry, checks, version, keys, classifier] = await Promise.all([
+      read($, route),
+      read($, isPaused),
+      read($, pin),
+      read($, panel),
+      read($, keyEntry),
+      read($, keyChecks),
+      read($, keyVersion),
+      availableKeys($, settings),
+      resolveClassifier($, settings),
+    ])
+    const judge = classifierLabel(classifier.settings)
+    const { Box, Text, Button, Input } = $.ui.resolve(e)
 
+    // One numbered option, as Claude's question dialog draws them: the number, a title, a quiet line under it.
+    const option = (id: string, index: number, title: string, note: string, isSelected: boolean, onPress: () => void, below?: unknown) => (
+      <Box key={`row-${id}`} flexDirection="column">
+        <Button key={`opt-${id}`} plain hotkey={String(index)} onPress={onPress}>
+          {isSelected ? <Text color="claude" bold>{`${title}  ✓`}</Text> : <Text bold>{title}</Text>}
+          <Text dimColor>{`  ${note}`}</Text>
+        </Button>
+        {below as never}
+      </Box>
+    )
+
+    const header = (title: string, subtitle: string) => {
+      if (e.surface === 'desktop') {
+        const { Svg } = $.ui.resolve(e)
+        const art = headerSvg(title, subtitle)
+        return <Svg source={art.source} alt={art.alt} width={art.width} height={art.height} />
+      }
+      return (
+        <Box flexDirection="column">
+          <Text color="claude" bold>{`✻ ${title}`}</Text>
+          <Text dimColor>{subtitle}</Text>
+        </Box>
+      )
+    }
+
+    // The classifier choices, with a key field under one that has no key yet.
+    const brainOptions = (startAt: number) => {
+      const slotOf: Partial<Record<Settings['provider'], RouterKeySlot>> = { jev: 'typesafe', 'openai-decisions': 'openai' }
+      const choices: { value: Settings['provider']; title: string; note: string }[] = [
+        { value: 'auto', title: 'Auto', note: `the best key you have · now ${judge}` },
+        { value: 'claude-plan', title: 'Your Claude plan', note: 'Haiku 5.5 decides · no key needed' },
+        { value: 'jev', title: 'Jev by TypeSafe', note: keys.typesafe ? `fastest, calibrated odds · ••••${keys.typesafe.key.slice(-4)}` : 'fastest, calibrated odds · needs a key' },
+        { value: 'openai-decisions', title: 'OpenAI Decisions', note: keys.openai ? `gpt-6-luna · ••••${keys.openai.key.slice(-4)}` : 'gpt-6-luna · needs a key' },
+      ]
+      return choices.map((choice, at) => {
+        const slot = slotOf[choice.value]
+        const check = slot && checks[slot]
+        const field =
+          slot !== undefined && entry === slot ? (
+            <Box key={`entry-${slot}`} flexDirection="column" marginLeft={3}>
+              <Input
+                key={`${slot}-band-key-${version}`}
+                placeholder={SLOTS[slot].placeholder}
+                submitLabel="save"
+                onSubmit={value => void saveKeyAndUse($, settings, slot, choice.value, value)}
+              />
+              {check && <Text color={check.state === 'ok' ? 'success' : check.state === 'failed' ? 'error' : undefined}>{check.text}</Text>}
+            </Box>
+          ) : undefined
+        const needsKey = slot !== undefined && keys[slot] === undefined
+        return option(choice.value, startAt + at, choice.title, choice.note, settings.provider === choice.value, () =>
+          void (needsKey ? update($, keyEntry, () => slot ?? null) : chooseProvider($, choice.value)), field)
+      })
+    }
+
+    if (page === 'welcome') {
+      return (
+        <Box key="router-panel" flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
+          <Box justifyContent="space-between">
+            {header('Smart model routing', 'Every prompt gets the model it needs')}
+            <Button key="router-close" plain role="dismiss" label="×" onPress={() => void finishWelcome($)} />
+          </Box>
+          <Text>Quick asks go to Haiku, everyday coding to Sonnet, hard problems to Opus. You can always pin a model.</Text>
+          <Box marginTop={1}>
+            <Text bold>How should each prompt be judged?</Text>
+          </Box>
+          {brainOptions(1)}
+          <Box marginTop={1}>
+            <Button key="router-start" variant="primary" label="Start routing" onPress={() => void finishWelcome($)} />
+          </Box>
+        </Box>
+      )
+    }
+
+    if (page !== 'closed') {
+      const pages = ['model', 'effort', 'brain'] as const
+      const at = pages.indexOf(page)
+      const go = (step: number) => () => void update($, panel, () => pages[(at + step + pages.length) % pages.length] ?? 'model')
+      const tiers = availableTiers(settings)
+      const titles = { model: 'Which model?', effort: 'How hard should it think?', brain: 'Who decides, and with which key?' }
+      let body: unknown
+      if (page === 'model') {
+        const notes = { haiku: 'quick questions, small edits', sonnet: 'everyday coding', opus: 'hard, multi-file, design', fable: 'the hardest problems' }
+        body = [
+          option('tier-auto', 1, 'Auto', `picks per prompt · now ${chosen ? modelLabel(chosen.model) : 'ready'}`, pinned?.tier === undefined, () => void setPinned($, { tier: undefined })),
+          ...tiers.map((tier, index) =>
+            option(`tier-${tier}`, index + 2, modelLabel(settings.models[tier]), notes[tier], pinned?.tier === tier, () => void setPinned($, { tier })),
+          ),
+        ]
+      } else if (page === 'effort') {
+        const efforts = EFFORTS.slice(0, EFFORTS.indexOf(settings.maxEffort) + 1)
+        body = [
+          option('effort-auto', 1, 'Auto', `picks per prompt · now ${chosen?.effort ?? 'ready'}`, pinned?.effort === undefined, () => void setPinned($, { effort: undefined })),
+          ...efforts.map((effort, index) => {
+            const glyphs = effortGlyphs(effort)
+            return option(`effort-${effort}`, index + 2, `${glyphs.lit}${' '.repeat(glyphs.rest.length)} ${effort}`, EFFORT_NOTES[effort] ?? '', pinned?.effort === effort, () => void setPinned($, { effort }))
+          }),
+        ]
+      } else {
+        body = brainOptions(1)
+      }
+      return (
+        <Box key="router-panel" flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
+          <Box justifyContent="space-between" alignItems="center">
+            {header('Model routing', titles[page])}
+            <Box gap={1} alignItems="center">
+              <Button key="router-prev" plain label="‹" onPress={go(-1)} />
+              <Text dimColor>{`${at + 1} of ${pages.length}`}</Text>
+              <Button key="router-next" plain label="›" onPress={go(1)} />
+              <Button key="router-close" plain role="dismiss" label="×" onPress={() => void update($, panel, () => 'closed')} />
+            </Box>
+          </Box>
+          {body as never}
+        </Box>
+      )
+    }
+
+    const view = bandView({ route: chosen, isPaused: paused, pin: pinned, classifier: judge, isWorking: e.props.isWorking })
+    const controls = [
+      <Button key="router-model" label="Model" onPress={() => void update($, panel, () => 'model')} />,
+      <Button key="router-keys" label="Keys" onPress={() => void update($, panel, () => 'brain')} />,
+      <Button key="router-toggle" label={paused ? 'Resume' : 'Pause'} variant={paused ? 'primary' : undefined} onPress={() => void setPaused($, !paused)} />,
+    ]
     if (e.surface === 'desktop') {
       const { Svg } = $.ui.resolve(e)
       const art = cardSvg(view, false, 'band')
@@ -695,7 +859,6 @@ export const register: Register = (on, options) => {
         </Box>
       )
     }
-
     const accent = view.tone === 'amber' ? 'warning' : 'claude'
     const meter = view.effort === undefined ? undefined : effortGlyphs(view.effort)
     return (

@@ -79,6 +79,8 @@ Keys saved this way are stored in the plugin's own file in your Claude Code conf
 
 You don't need to do anything. Every prompt is routed:
 
+- **First run:** a welcome panel opens above the chat box. It asks one question, "How should each prompt be judged?", where you choose your Claude plan, Jev or OpenAI Decisions and can paste a key inline. Press **Start routing** when you're done.
+- **The panel**, opened with **Model** or **Keys** on the band, works like Claude's own question dialogs. It has three pages (Which model? / How hard should it think? / Who decides, and with which key?), each a numbered list: press a number to pick. **‹ ›** move between pages and **×** collapses the panel.
 - **The band above the chat box** (desktop app and terminal) is always visible. It shows the pick in force, its effort meter, which classifier decided and why, plus **Pause/Resume**, **Keys** and **Unpin** buttons. VS Code doesn't let plugins draw above the prompt, so there you get the card under each prompt instead.
 
 - **The card** under your prompt shows the model, a five-step effort meter, and why. In VS Code or the desktop app, hover the card to see which classifier decided. An amber card means nothing could decide, so the previous pick was kept, and the card says why.

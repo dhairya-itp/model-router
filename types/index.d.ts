@@ -36,6 +36,9 @@ export type RouterKeySlot = 'typesafe' | 'openai' | 'anthropic'
 /** The outcome of the pane's live check of one key. */
 export type RouterKeyCheck = { state: 'checking' | 'ok' | 'failed'; text: string }
 
+/** What the band above the prompt shows: one compact row, the first-run welcome, or one page of the panel. */
+export type RouterPanel = 'closed' | 'welcome' | 'model' | 'effort' | 'brain'
+
 declare module 'claude-code' {
   interface PluginState {
     'model-router': {
@@ -47,6 +50,9 @@ declare module 'claude-code' {
       keyChecks: Partial<Record<RouterKeySlot, RouterKeyCheck>>
       /** Bumped on every save or removal, so the pane's fields come back empty. */
       keyVersion: number
+      panel: RouterPanel
+      /** The provider whose key field is open under its row in the panel. */
+      keyEntry: RouterKeySlot | null
     }
   }
 }

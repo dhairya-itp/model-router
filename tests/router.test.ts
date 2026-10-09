@@ -529,6 +529,87 @@ describe('the keys pane', () => {
   })
 })
 
+describe('the panel above the prompt', () => {
+  const BAND = {
+    hasSurvey: false,
+    isWorking: false,
+    maxRows: 30,
+    bodyColumns: 100,
+    scroll: { offset: 0, bodyRows: 30 },
+    view: {},
+  }
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    test(`on ${surface}, pages through model, effort and keys, and pins with a number`, { options: KEY }, async ($, on) => {
+      const seen = world(on, claudeReply(SONNET))
+      const ui = await $.ui.mount({ plugin: 'model-router', surface, component: 'AbovePrompt', props: BAND })
+      await ui.press({ key: 'router-model' })
+
+      expect(await ui.find({ type: 'Text', text: /1 of 3/ })).toBeDefined()
+      expect(await ui.find({ type: 'Button', key: 'opt-tier-opus' })).toBeDefined()
+      await ui.press({ key: 'opt-tier-opus' })
+      expect(await ui.find({ type: 'Text', text: /Opus 5\.5  ✓/ })).toBeDefined()
+
+      await ui.press({ key: 'router-next' })
+      expect(await ui.find({ type: 'Text', text: /2 of 3/ })).toBeDefined()
+      await ui.press({ key: 'opt-effort-high' })
+
+      await $.prompt.submit({ text: 'fix the failing test', ...TYPED })
+      const sent = await step($.turn.step(STEP), seen)
+      expect(sent?.model).toBe('claude-opus-5-5')
+      expect(sent?.effort).toBe('high')
+      expect(seen.requests).toHaveLength(0)
+
+      await ui.press({ key: 'router-next' })
+      expect(await ui.find({ type: 'Text', text: /3 of 3/ })).toBeDefined()
+      await ui.press({ key: 'router-close' })
+      expect(await ui.find({ type: 'Button', key: 'router-model' })).toBeDefined()
+      await ui.unmount()
+    })
+  }
+
+  test('choosing Jev without a key opens a key field under it, and saving the key makes Jev the classifier', async ($, on) => {
+    const seen = world(on, jsonReply({
+      answers: {
+        tier: { type: 'choice', choice: 'haiku', probabilities: { haiku: 0.95, sonnet: 0.05 }, confidence: 0.95 },
+        effort: { type: 'choice', choice: 'low', probabilities: { low: 0.9, medium: 0.1 }, confidence: 0.9 },
+      },
+    }))
+    seen.rows = [
+      { key: 'model-router.provider', label: 'Classifier provider', kind: 'choice', value: 'auto', options: ['auto', 'jev'], provider: { plugin: 'model-router', tier: 'user' }, isLocked: false },
+    ]
+    const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND })
+    await ui.press({ key: 'router-keys' })
+    await ui.press({ key: 'opt-jev' })
+    await ui.input({ key: 'typesafe-band-key-0', text: 'ts-secret-key-9876' })
+
+    expect(seen.requests[0]?.headers.authorization).toBe('Bearer ts-secret-key-9876')
+    expect(seen.configSets).toEqual([{ key: 'model-router.provider', value: 'jev' }])
+    expect(await ui.find({ text: /ts-secret-key-9876/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /••••9876/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a first session opens the welcome, and Start routing closes it for good', async ($, on) => {
+    world(on, claudeReply(SONNET))
+    on('command.register', () => ({ value: { command: 'router' } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd, startedAt: 0, context: { window: 1000000 } }))
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+
+    expect(await ui.find({ type: 'Text', text: /Smart model routing/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /How should each prompt be judged/ })).toBeDefined()
+    await ui.press({ key: 'router-start' })
+    expect(await ui.find({ type: 'Button', key: 'router-model' })).toBeDefined()
+    await ui.unmount()
+
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+    const again = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+    expect(await again.find({ type: 'Text', text: /Smart model routing/ })).toBeUndefined()
+    await again.unmount()
+  })
+})
+
 describe("the app's model picker follows the pick", () => {
   test('moves the built-in Model and Effort rows when the session has them', { options: KEY }, async ($, on) => {
     const seen = world(on, claudeReply(SONNET))
@@ -600,7 +681,9 @@ describe('the band above the prompt', () => {
       expect((await ui.find({ type: 'Button', key: 'router-toggle' }))?.props.label).toBe('Pause')
 
       await ui.press({ key: 'router-keys' })
-      expect(opened).toEqual(['router-keys'])
+      const keysPage = surface === 'desktop' ? String((await ui.find({ type: 'Svg' }))?.props.alt) : (await ui.find({ type: 'Text', text: /Who decides/ }))?.text
+      expect(keysPage).toContain('Who decides')
+      expect(opened).toEqual([])
       await ui.unmount()
     })
   }
