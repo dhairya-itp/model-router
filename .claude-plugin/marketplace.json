@@ -1,0 +1,14 @@
+{
+  "name": "model-router",
+  "owner": {
+    "name": "Dhairya"
+  },
+  "description": "Routes each Claude Code prompt to the right model and effort, with your own classifier key.",
+  "plugins": [
+    {
+      "name": "model-router",
+      "source": "./",
+      "description": "Picks the right Claude model and effort for each prompt: Haiku 5.5 on your Claude plan, or Jev, OpenAI Decisions and more on your own key."
+    }
+  ]
+}

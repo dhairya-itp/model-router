@@ -1,0 +1,103 @@
+{
+  "name": "model-router",
+  "version": "0.1.0",
+  "description": "Picks the right Claude model and effort for each prompt. Classifies with Haiku 5.5 on your Claude plan (no key), or on your own key with Jev (TypeSafe AI), OpenAI's Decisions API, Anthropic, OpenAI or any OpenAI-compatible endpoint.",
+  "author": {
+    "name": "Dhairya"
+  },
+  "keywords": [
+    "model",
+    "routing",
+    "effort",
+    "cost",
+    "byok",
+    "jev",
+    "decisions"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "provider": {
+      "type": "string",
+      "title": "Classifier provider",
+      "description": "Who picks the model. auto (default): Jev if TYPESAFE_API_KEY is set, else OpenAI Decisions if OPENAI_API_KEY is set, else Haiku 5.5 on your Claude plan. Or choose one: claude-plan (no key), jev (TypeSafe AI, direct), openai-decisions (gpt-6-luna), anthropic, openai, openai-compatible. If a keyed classifier fails, Haiku on your plan decides.",
+      "options": [
+        "auto",
+        "claude-plan",
+        "jev",
+        "openai-decisions",
+        "anthropic",
+        "openai",
+        "openai-compatible"
+      ],
+      "default": "auto"
+    },
+    "apiKey": {
+      "type": "string",
+      "title": "Classifier API key",
+      "description": "Optional. Your key for the provider; under auto, an OpenAI key (sk-...) means OpenAI Decisions, an Anthropic key (sk-ant-...) means Anthropic, anything else means Jev. Kept in secure storage. Empty: environment variables (TYPESAFE_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, MODEL_ROUTER_API_KEY).",
+      "sensitive": true,
+      "default": ""
+    },
+    "classifierModel": {
+      "type": "string",
+      "title": "Classifier model",
+      "description": "Empty uses the provider's default: haiku (claude-plan), jev-latest (jev), gpt-6-luna (openai-decisions), claude-haiku-5-5 (anthropic), gpt-5-mini (openai). Required for openai-compatible. Ignored under auto.",
+      "default": ""
+    },
+    "baseUrl": {
+      "type": "string",
+      "title": "Classifier base URL",
+      "description": "Empty uses the provider's default: https://api.typesafe.ai/v1 (jev), https://api.openai.com/v1 (openai, openai-decisions). Required for openai-compatible. Ignored under auto.",
+      "default": ""
+    },
+    "haikuModel": {
+      "type": "string",
+      "title": "Fast tier model",
+      "description": "Model for quick, simple prompts. Empty turns this tier off.",
+      "default": "claude-haiku-5-5"
+    },
+    "sonnetModel": {
+      "type": "string",
+      "title": "Everyday tier model",
+      "description": "Model for routine coding work. Empty turns this tier off.",
+      "default": "claude-sonnet-5-5"
+    },
+    "opusModel": {
+      "type": "string",
+      "title": "Deep tier model",
+      "description": "Model for hard, open-ended or multi-file work. Empty turns this tier off.",
+      "default": "claude-opus-5-5"
+    },
+    "fableModel": {
+      "type": "string",
+      "title": "Frontier tier model",
+      "description": "Model for the very hardest problems (about 2.5x Opus pricing). Off by default: set to claude-fable-5-1 to allow it.",
+      "default": ""
+    },
+    "maxEffort": {
+      "type": "string",
+      "title": "Highest effort allowed",
+      "description": "The router never asks for more effort than this.",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "xhigh"
+    },
+    "announce": {
+      "type": "boolean",
+      "title": "Show the routing card",
+      "description": "Draw a card under each prompt with the model, effort and why it was picked. The model never sees it.",
+      "default": true
+    },
+    "timeoutMs": {
+      "type": "number",
+      "title": "Classifier timeout (ms)",
+      "description": "How long to wait for the classifier before keeping the current model. 1000 to 8000.",
+      "default": 6000
+    }
+  }
+}
