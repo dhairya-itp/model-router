@@ -298,45 +298,101 @@ async function decide(
       tier,
       model: settings.models[tier],
       effort,
-      reason: `${outcome.verdict.reason || 'no reason given'}${note}${stepIn}`,
+      // A pinned part is the person's; the classifier's own words would argue with it, so they explain only the rest.
+      reason:
+        fixedTier !== undefined
+          ? `${source === 'inline' ? 'you chose' : 'pinned'} ${modelLabel(settings.models[tier])} · ${effort} effort picked by ${classifierLabel(used)}${stepIn}`
+          : fixed.effort !== undefined
+            ? `${source === 'inline' ? 'you chose' : 'pinned'} ${effort} effort · ${outcome.verdict.reason || 'model picked'}${note}${stepIn}`
+            : `${outcome.verdict.reason || 'no reason given'}${note}${stepIn}`,
       source: isFixed ? source : 'classifier',
       classifier: classifierLabel(used),
     },
   }
 }
 
-/** The effort the app's picker was last moved to by this module, so it is moved only on a change. */
+/** The saved default model and per-model effort, as the user settings held them before the picker first moved. */
+type SavedDefaults = { model: unknown; modelSettings: unknown }
+
+const DEFAULTS_STORE = 'savedDefaults'
+
+/** The effort the app's picker was last moved to in this session, so it is moved only on a change. */
 let syncedEffort: string | undefined
 
-/** Picker moves only a slash command can make, held for the turn's end: a command cannot run inside the prompt's own hook. */
-let pendingCommands: { command: string; args: string }[] = []
+/** The user settings file the picker's moves are saved to. */
+async function userSettingsPath($: EngineInterface): Promise<string | undefined> {
+  const dir = (await $.env.get('CLAUDE_CONFIG_DIR'))?.trim()
+  if (dir) return `${dir.replace(/\/+$/, '')}/settings.json`
+  const home = (await $.env.get('HOME'))?.trim()
+  return home ? `${home}/.claude/settings.json` : undefined
+}
 
 /**
- * Moves the app's own model and effort picker to the route, as the person
- * would: the built-in /config rows when the session has them, else /model and
- * /effort. Only on a change, and never fatally: the per-request override in
- * `turn.step` holds the route either way.
+ * Puts the saved default model and per-model effort back into the user
+ * settings file, as they were before the picker first moved, and forgets the
+ * snapshot. Every other key of the file is left as it is.
+ */
+async function restoreDefaults($: EngineInterface): Promise<void> {
+  const saved = (await $.store.get(DEFAULTS_STORE)) as SavedDefaults | undefined
+  if (saved === undefined || saved === null) return
+  const path = await userSettingsPath($)
+  if (path === undefined) return
+  try {
+    const current = JSON.parse(String(await $.fs.read(path))) as Record<string, unknown>
+    for (const key of ['model', 'modelSettings'] as const) {
+      if (saved[key] === null || saved[key] === undefined) delete current[key]
+      else current[key] = saved[key]
+    }
+    await $.fs.write(path, `${JSON.stringify(current, null, 2)}\n`)
+    await $.store.delete(DEFAULTS_STORE)
+  } catch {
+    // Left for the next session start to try again.
+  }
+}
+
+/**
+ * Moves the app's own model and effort picker to the route through Claude
+ * Code's /config rows, as the person would. Those rows also save to the user
+ * settings, so the saved defaults are recorded first and restored when the
+ * session ends. Only on a change; the per-request override in `turn.step`
+ * holds the route whatever happens here.
  */
 async function syncPicker($: EngineInterface, settings: Settings, chosen: RouterRoute): Promise<void> {
   if (!settings.syncPicker) return
   try {
     const rows = (await $.config.list()).filter(row => row.provider.plugin === 'engine')
-    if (!isSameModel(await $.session.model(), chosen.model)) {
-      const row = rows.find(one => one.key === 'model' || /^model$/i.test(one.label))
-      const value = row && pickerOption(row.options, chosen.model, chosen.tier)
-      const set = row && value !== undefined ? await $.config.set({ key: row.key, value }) : undefined
-      if (set === undefined || set.deny !== undefined) pendingCommands.push({ command: 'model', args: chosen.model })
+    const modelRow = rows.find(one => one.key === 'model' || /^model$/i.test(one.label))
+    const effortRow = rows.find(one => /effort/i.test(one.key) || /effort/i.test(one.label))
+    const moveModel = modelRow !== undefined && !isSameModel(await $.session.model(), chosen.model)
+    const moveEffort = effortRow !== undefined && syncedEffort !== chosen.effort
+    if (!moveModel && !moveEffort) return
+    if ((await $.store.get(DEFAULTS_STORE)) === undefined) {
+      const user = (await $.settings.read({ source: 'user' })) as Record<string, unknown>
+      const snapshot: SavedDefaults = { model: user.model ?? null, modelSettings: user.modelSettings ?? null }
+      await $.store.set(DEFAULTS_STORE, snapshot)
     }
-    if (syncedEffort !== chosen.effort) {
-      const row = rows.find(one => /effort/i.test(one.key) || /effort/i.test(one.label))
-      const value = row && pickerOption(row.options, chosen.effort)
-      const set = row && value !== undefined ? await $.config.set({ key: row.key, value }) : undefined
-      if (set === undefined || set.deny !== undefined) pendingCommands.push({ command: 'effort', args: chosen.effort })
+    if (moveModel && modelRow !== undefined) {
+      const value = pickerOption(modelRow.options, chosen.model, chosen.tier)
+      if (value !== undefined) await $.config.set({ key: modelRow.key, value })
+    }
+    if (moveEffort && effortRow !== undefined) {
+      const value = pickerOption(effortRow.options, chosen.effort)
+      if (value !== undefined) await $.config.set({ key: effortRow.key, value })
       syncedEffort = chosen.effort
     }
   } catch {
     // The picker stays where it was; every request still goes to the route.
   }
+}
+
+/**
+ * The status line under the prompt, where it reads well: the desktop app and the
+ * editor draw it as a quiet label, the terminal as a warning-styled notice, and
+ * there the band above the prompt already says the same.
+ */
+async function showStatus($: EngineInterface, text: string | undefined): Promise<void> {
+  const surfaces: readonly string[] = await $.session.surfaces().catch(() => [])
+  $.ui.status(surfaces.includes('terminal') ? undefined : text)
 }
 
 /** Records a decision: the route, the status line, and the card drawn under the prompt. */
@@ -347,13 +403,13 @@ async function apply($: EngineInterface, settings: Settings, decision: Decision,
     const chosen = decision.route
     await update($, route, () => chosen)
     await update($, lastError, () => null)
-    $.ui.status(statusLine(chosen, false))
+    await showStatus($, statusLine(chosen, false))
     await syncPicker($, settings, chosen)
     card = { seq, key: cardKey(text), route: chosen }
   } else {
     await update($, lastError, () => decision.error)
     const kept = await read($, route)
-    $.ui.status(statusLine(kept, false))
+    await showStatus($, statusLine(kept, false))
     card = { seq, key: cardKey(text), route: kept ?? undefined, kept: decision.error }
   }
   await update($, cards, list => [...list, card].slice(-CARD_LIMIT))
@@ -535,7 +591,7 @@ async function finishWelcome($: EngineInterface): Promise<void> {
 /** Pauses or resumes routing, from the command or the band's button. */
 async function setPaused($: EngineInterface, paused: boolean): Promise<void> {
   await update($, isPaused, () => paused)
-  $.ui.status(statusLine(paused ? null : await read($, route), paused))
+  await showStatus($, statusLine(paused ? null : await read($, route), paused))
 }
 
 async function openKeys($: EngineInterface): Promise<boolean> {
@@ -609,13 +665,20 @@ async function runCommand($: EngineInterface, settings: Settings, args: string):
 export const register: Register = (on, options) => {
   const settings = readSettings(options)
 
+  // A session that ended without restoring (a crash, a kill) left the picker's moves in the saved defaults.
+  on('session.end', async ($, e, next) => {
+    await restoreDefaults($)
+    return next(e)
+  })
+
   on('session.start', async ($, e, next) => {
+    await restoreDefaults($)
     await $.command.register({
       name: 'router',
       description: 'See or steer how each prompt picks its model and effort',
       argumentHint: '[test <prompt> | pin <model> [effort] | unpin | on | off]',
     })
-    $.ui.status(statusLine(await read($, route), await read($, isPaused)))
+    await showStatus($, statusLine(await read($, route), await read($, isPaused)))
     if ((await $.store.get('onboarded')) !== true) await update($, panel, () => 'welcome')
 
     return next(e)
@@ -632,7 +695,15 @@ export const register: Register = (on, options) => {
     const asked = inline?.rest ?? text
     await apply($, settings, await decide($, settings, asked, fixed, inline === undefined ? 'pin' : 'inline'), asked)
 
-    return next(inline === undefined ? e : { ...e, text: asked })
+    // The system prompt names the session's default model; tell the model which one really runs this turn.
+    const chosen = await read($, route)
+    const note =
+      chosen === null
+        ? undefined
+        : `model-router: this turn runs on Claude ${modelLabel(chosen.model)} (model ID ${chosen.model}) at ${chosen.effort} effort, chosen per prompt by the model router. ` +
+          'Where the system prompt names another model, that is only the session default; if asked which model you are, answer with this one.'
+    const context = note === undefined ? e.context : [...(e.context ?? []), note]
+    return next({ ...e, ...(inline === undefined ? {} : { text: asked }), ...(context === undefined ? {} : { context }) })
   })
 
   // The prompt's row is stored: its card learns the row's id, so a repeated "yes" finds its own card.
@@ -644,17 +715,6 @@ export const register: Register = (on, options) => {
       await update($, cards, list => list.map(card => (card.seq === seq ? { ...card, id: e.uuid } : card)))
     }
     return next(e)
-  })
-
-  // The picker moves that need /model or /effort, once the turn that held them is over.
-  on('turn.complete', async ($, e, next) => {
-    const result = await next(e)
-    if (e.agentId === undefined && pendingCommands.length > 0) {
-      const commands = pendingCommands
-      pendingCommands = []
-      for (const command of commands) await $.command.run(command).catch(() => undefined)
-    }
-    return result
   })
 
   on('turn.step', async function* ($, e, next) {
@@ -683,15 +743,17 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column">
           {base}
           <Box marginLeft={2} borderStyle="round" borderColor={accent} paddingX={1} alignSelf="flex-start">
+          <Text wrap="truncate-end">
             <Text color={accent} bold>
-              ✻{' '}
+              {'✻ '}
             </Text>
             <Text bold>{view.title}</Text>
             {meter && <Text color={accent}>{`  ${meter.lit}`}</Text>}
             {meter && <Text dimColor>{meter.rest}</Text>}
             {view.effort && <Text>{` ${view.effort}`}</Text>}
             {view.tag && <Text color={accent}>{` · ${view.tag}`}</Text>}
-            <Text dimColor wrap="truncate-end">{` · ${view.detail}`}</Text>
+            <Text dimColor>{` · ${view.detail}`}</Text>
+          </Text>
           </Box>
         </Box>
       )
@@ -703,7 +765,7 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column">
         {base}
         <Box key={`route-${card.seq}`}>
-          <Svg source={art.source} alt={art.alt} width={art.width} height={art.height} isInteractive />
+          <Svg source={art.source} alt={art.alt} width={art.width} height={art.height} />
         </Box>
       </Box>
     )
@@ -727,11 +789,13 @@ export const register: Register = (on, options) => {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
 
     // One numbered option, as Claude's question dialog draws them: the number, a title, a quiet line under it.
+    // Titles are padded to one column so every quiet line starts at the same place.
+    const titleWidth = 18
     const option = (id: string, index: number, title: string, note: string, isSelected: boolean, onPress: () => void, below?: unknown) => (
       <Box key={`row-${id}`} flexDirection="column">
         <Button key={`opt-${id}`} plain hotkey={String(index)} onPress={onPress}>
-          {isSelected ? <Text color="claude" bold>{`${title}  ✓`}</Text> : <Text bold>{title}</Text>}
-          <Text dimColor>{`  ${note}`}</Text>
+          {isSelected ? <Text color="claude" bold>{`● ${title.padEnd(titleWidth)}`}</Text> : <Text bold>{`○ ${title.padEnd(titleWidth)}`}</Text>}
+          <Text dimColor>{note}</Text>
         </Button>
         {below as never}
       </Box>
@@ -784,9 +848,9 @@ export const register: Register = (on, options) => {
     if (page === 'welcome') {
       return (
         <Box key="router-panel" flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
-          <Box justifyContent="space-between">
+          <Box justifyContent="space-between" alignItems="flex-start">
             {header('Smart model routing', 'Every prompt gets the model it needs')}
-            <Button key="router-close" plain role="dismiss" label="×" onPress={() => void finishWelcome($)} />
+            <Button key="router-close" plain hotkey="x" role="dismiss" label="×" onPress={() => void finishWelcome($)} />
           </Box>
           <Text>Quick asks go to Haiku, everyday coding to Sonnet, hard problems to Opus. You can always pin a model.</Text>
           <Box marginTop={1}>
@@ -829,13 +893,13 @@ export const register: Register = (on, options) => {
       }
       return (
         <Box key="router-panel" flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
-          <Box justifyContent="space-between" alignItems="center">
+          <Box justifyContent="space-between" alignItems="flex-start">
             {header('Model routing', titles[page])}
-            <Box gap={1} alignItems="center">
-              <Button key="router-prev" plain label="‹" onPress={go(-1)} />
+            <Box gap={1}>
+              <Button key="router-prev" plain hotkey="b" label="‹" onPress={go(-1)} />
               <Text dimColor>{`${at + 1} of ${pages.length}`}</Text>
-              <Button key="router-next" plain label="›" onPress={go(1)} />
-              <Button key="router-close" plain role="dismiss" label="×" onPress={() => void update($, panel, () => 'closed')} />
+              <Button key="router-next" plain hotkey="n" label="›" onPress={go(1)} />
+              <Button key="router-close" plain hotkey="x" role="dismiss" label="×" onPress={() => void update($, panel, () => 'closed')} />
             </Box>
           </Box>
           {body as never}
@@ -845,16 +909,16 @@ export const register: Register = (on, options) => {
 
     const view = bandView({ route: chosen, isPaused: paused, pin: pinned, classifier: judge, isWorking: e.props.isWorking })
     const controls = [
-      <Button key="router-model" label="Model" onPress={() => void update($, panel, () => 'model')} />,
-      <Button key="router-keys" label="Keys" onPress={() => void update($, panel, () => 'brain')} />,
-      <Button key="router-toggle" label={paused ? 'Resume' : 'Pause'} variant={paused ? 'primary' : undefined} onPress={() => void setPaused($, !paused)} />,
+      <Button key="router-model" label="Model" hotkey="m" onPress={() => void update($, panel, () => 'model')} />,
+      <Button key="router-keys" label="Keys" hotkey="k" onPress={() => void update($, panel, () => 'brain')} />,
+      <Button key="router-toggle" label={paused ? 'Resume' : 'Pause'} hotkey="p" {...(paused ? { variant: 'primary' as const } : {})} onPress={() => void setPaused($, !paused)} />,
     ]
     if (e.surface === 'desktop') {
       const { Svg } = $.ui.resolve(e)
       const art = cardSvg(view, false, 'band')
       return (
         <Box key="router-band" flexDirection="row" alignItems="center" gap={1}>
-          <Svg source={art.source} alt={art.alt} width={art.width} height={art.height} isInteractive />
+          <Svg source={art.source} alt={art.alt} width={art.width} height={art.height} />
           {controls}
         </Box>
       )
@@ -862,17 +926,19 @@ export const register: Register = (on, options) => {
     const accent = view.tone === 'amber' ? 'warning' : 'claude'
     const meter = view.effort === undefined ? undefined : effortGlyphs(view.effort)
     return (
-      <Box key="router-band" flexDirection="row" alignItems="center" gap={1}>
-        <Box borderStyle="round" borderColor={accent} paddingX={1} flexShrink={1}>
-          <Text color={accent} bold>
-            ✻{' '}
+      <Box key="router-band" flexDirection="row" gap={1}>
+        <Box flexShrink={1} flexGrow={1}>
+          <Text wrap="truncate-end">
+            <Text color={accent} bold>
+              {'✻ '}
+            </Text>
+            <Text bold>{view.title}</Text>
+            {meter && <Text color={accent}>{`  ${meter.lit}`}</Text>}
+            {meter && <Text dimColor>{meter.rest}</Text>}
+            {view.effort && <Text>{` ${view.effort}`}</Text>}
+            {view.tag && <Text color={accent}>{` · ${view.tag}`}</Text>}
+            <Text dimColor>{` · ${view.detail}`}</Text>
           </Text>
-          <Text bold>{view.title}</Text>
-          {meter && <Text color={accent}>{`  ${meter.lit}`}</Text>}
-          {meter && <Text dimColor>{meter.rest}</Text>}
-          {view.effort && <Text>{` ${view.effort}`}</Text>}
-          {view.tag && <Text color={accent}>{` · ${view.tag}`}</Text>}
-          <Text dimColor wrap="truncate-end">{` · ${view.detail}`}</Text>
         </Box>
         {controls}
       </Box>

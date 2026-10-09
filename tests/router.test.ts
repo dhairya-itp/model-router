@@ -43,6 +43,7 @@ function world(on: On, reply: HttpResponse, env: Record<string, string> = {}, st
     requests: [] as { url: string; headers: Record<string, string>; body: string }[],
     planCalls: [] as { model: string; system?: string }[],
     prompts: [] as string[],
+    contexts: [] as (readonly string[] | undefined)[],
     steps: [] as TurnStepInput[],
     toasts: [] as string[],
     status: [] as (string | undefined)[],
@@ -84,6 +85,7 @@ function world(on: On, reply: HttpResponse, env: Record<string, string> = {}, st
   })
   on('prompt.submit', ($, e) => {
     seen.prompts.push(e.text)
+    seen.contexts.push(e.context)
     return { text: e.text }
   })
   on('turn.complete', ($, e) => ({ text: '' }))
@@ -121,6 +123,7 @@ describe('every prompt is routed', () => {
     expect(seen.requests[0]?.headers['x-api-key']).toBe('sk-test')
     expect(seen.status.at(-1)).toBe('✻ Sonnet 5.5 · medium')
     expect(await routerStatus($)).toContain('by Haiku · API key · routine single-file fix')
+    expect(seen.contexts.at(-1)?.join('\n')).toContain('this turn runs on Claude Sonnet 5.5 (model ID claude-sonnet-5-5)')
   })
 
   test('a prompt typed while a turn runs is routed too', { options: KEY }, async ($, on) => {
@@ -548,7 +551,7 @@ describe('the panel above the prompt', () => {
       expect(await ui.find({ type: 'Text', text: /1 of 3/ })).toBeDefined()
       expect(await ui.find({ type: 'Button', key: 'opt-tier-opus' })).toBeDefined()
       await ui.press({ key: 'opt-tier-opus' })
-      expect(await ui.find({ type: 'Text', text: /Opus 5\.5  ✓/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /● Opus 5\.5/ })).toBeDefined()
 
       await ui.press({ key: 'router-next' })
       expect(await ui.find({ type: 'Text', text: /2 of 3/ })).toBeDefined()
@@ -610,41 +613,74 @@ describe('the panel above the prompt', () => {
   })
 })
 
-describe("the app's model picker follows the pick", () => {
-  test('moves the built-in Model and Effort rows when the session has them', { options: KEY }, async ($, on) => {
-    const seen = world(on, claudeReply(SONNET))
-    seen.rows = [
-      { key: 'model', label: 'Model', kind: 'choice', value: 'opus', options: ['default', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false },
-      { key: 'effortLevel', label: 'Effort', kind: 'choice', value: 'high', options: ['low', 'medium', 'high', 'xhigh', 'max'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false },
-    ]
-    await $.prompt.submit({ text: 'fix the failing test', ...TYPED })
+describe("the app's model picker follows the pick, and your saved default comes back", () => {
+  const ROWS: ConfigRow[] = [
+    { key: 'model', label: 'Model', kind: 'choice', value: 'opus', options: ['default', 'opus', 'claude-sonnet-5-5', 'claude-haiku-5-5'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false },
+    { key: 'effortLevel', label: 'Effort', kind: 'choice', value: 'high', options: ['low', 'medium', 'high', 'xhigh', 'max'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false },
+  ]
+  const SAVED = { theme: 'dark', model: 'opus', modelSettings: { 'claude-opus-5-5': { effortLevel: 'high' } } }
 
+  /** A user settings file on disk that the /config rows write into, as Claude Code's do. */
+  function settingsFile(on: On, seen: ReturnType<typeof world>) {
+    const file = { text: JSON.stringify(SAVED, null, 2), writes: 0 }
+    on('settings.read', () => ({ value: JSON.parse(file.text) }))
+    on('fs.read', ($, e) => ({ value: e.path === '/home/me/.claude/settings.json' ? file.text : '' }))
+    on('fs.write', ($, e) => {
+      file.text = e.text
+      file.writes += 1
+      return { value: undefined }
+    })
+    seen.rows = ROWS
+    return file
+  }
+
+  test('moves the Model and Effort rows, then restores the saved default when the session ends', { options: KEY }, async ($, on) => {
+    const seen = world(on, claudeReply(SONNET), { HOME: '/home/me' })
+    const file = settingsFile(on, seen)
+    on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+
+    await $.prompt.submit({ text: 'fix the failing test', ...TYPED })
     expect(seen.configSets).toEqual([
       { key: 'model', value: 'claude-sonnet-5-5' },
       { key: 'effortLevel', value: 'medium' },
     ])
+    // Claude Code's rows save the pick as the default; the plugin's job is to undo that at the end.
+    file.text = JSON.stringify({ ...SAVED, model: 'claude-sonnet-5-5', modelSettings: { 'claude-sonnet-5-5': { effortLevel: 'medium' } } })
+
+    await $.session.end({ reason: 'prompt_input_exit', sessionId: 's1' } as never)
+
+    expect(JSON.parse(file.text)).toEqual(SAVED)
     expect(seen.commands).toEqual([])
   })
 
-  test('falls back to /model and /effort, and leaves a model already in place alone', { options: KEY }, async ($, on) => {
-    const seen = world(on, claudeReply(SONNET))
-    await $.prompt.submit({ text: 'fix the failing test', ...TYPED })
-    expect(seen.commands).toEqual([])
-    await $.turn.complete({ turnId: 't1', reason: 'answer', answer: '', durationMs: 10, isAborted: false })
-    expect(seen.commands).toEqual(['/model claude-sonnet-5-5', '/effort medium'])
+  test('a session that crashed is cleaned up when the next one starts', { options: KEY }, async ($, on) => {
+    const seen = world(on, claudeReply(SONNET), { HOME: '/home/me' }, { savedDefaults: { model: 'opus', modelSettings: null } })
+    const file = settingsFile(on, seen)
+    file.text = JSON.stringify({ theme: 'dark', model: 'claude-haiku-5-5', modelSettings: { x: 1 } })
+    on('command.register', () => ({ value: { command: 'router' } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd, startedAt: 0, context: { window: 1000000 } }))
 
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+
+    expect(JSON.parse(file.text)).toEqual({ theme: 'dark', model: 'opus' })
+  })
+
+  test('leaves a model already in place alone', { options: KEY }, async ($, on) => {
+    const seen = world(on, claudeReply(SONNET), { HOME: '/home/me' })
+    settingsFile(on, seen)
     seen.sessionModel = 'claude-sonnet-5-5[1m]'
-    await $.prompt.submit({ text: 'and the next one', ...TYPED })
-    await $.turn.complete({ turnId: 't2', reason: 'answer', answer: '', durationMs: 10, isAborted: false })
-    expect(seen.commands).toHaveLength(2)
+    await $.prompt.submit({ text: 'fix the failing test', ...TYPED })
+
+    expect(seen.configSets).toEqual([{ key: 'effortLevel', value: 'medium' }])
   })
 
   test('can be turned off', { options: { ...KEY, syncPicker: false } }, async ($, on) => {
-    const seen = world(on, claudeReply(SONNET))
+    const seen = world(on, claudeReply(SONNET), { HOME: '/home/me' })
+    const file = settingsFile(on, seen)
     await $.prompt.submit({ text: 'fix the failing test', ...TYPED })
 
-    expect(seen.commands).toEqual([])
     expect(seen.configSets).toEqual([])
+    expect(file.writes).toBe(0)
   })
 })
 

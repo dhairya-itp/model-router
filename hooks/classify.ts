@@ -767,6 +767,7 @@ export function parseInline(text: string): { choice: InlineChoice; rest: string 
   return rest.trim() === '' ? undefined : { choice, rest }
 }
 
+
 /** The picker option that names `wanted`: the exact value, else one naming the tier (`opus`), else none. */
 export function pickerOption(options: readonly string[] | undefined, wanted: string, tier?: string): string | undefined {
   if (options === undefined || options.length === 0) return wanted

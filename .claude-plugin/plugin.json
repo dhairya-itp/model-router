@@ -96,7 +96,7 @@
     "syncPicker": {
       "type": "boolean",
       "title": "Move the app's model picker",
-      "description": "After each pick, set Claude Code's own model and effort (the picker in the desktop app, /model) to it, so the app shows what is running.",
+      "description": "After each pick, set Claude Code's own model and effort (/model, the app's picker) to it. Claude Code saves those to your settings; the plugin puts your saved default back when the session ends.",
       "default": true
     },
     "timeoutMs": {
