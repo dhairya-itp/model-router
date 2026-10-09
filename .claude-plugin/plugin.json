@@ -93,6 +93,12 @@
       "description": "Draw a card under each prompt with the model, effort and why it was picked. The model never sees it.",
       "default": true
     },
+    "syncPicker": {
+      "type": "boolean",
+      "title": "Move the app's model picker",
+      "description": "After each pick, set Claude Code's own model and effort (the picker in the desktop app, /model) to it, so the app shows what is running.",
+      "default": true
+    },
     "timeoutMs": {
       "type": "number",
       "title": "Classifier timeout (ms)",

@@ -1,4 +1,4 @@
-import type { HttpResponse, ModelCompleteResult, On, TurnStepInput } from 'claude-code'
+import type { ConfigRow, HttpResponse, ModelCompleteResult, On, TurnStepInput } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
@@ -46,6 +46,10 @@ function world(on: On, reply: HttpResponse, env: Record<string, string> = {}, st
     steps: [] as TurnStepInput[],
     toasts: [] as string[],
     status: [] as (string | undefined)[],
+    sessionModel: 'claude-fable-5-1',
+    rows: [] as ConfigRow[],
+    configSets: [] as { key: string; value: unknown }[],
+    commands: [] as string[],
   }
   mock.clock(on, { now: 1000 })
   mock.env(on, env)
@@ -59,6 +63,16 @@ function world(on: On, reply: HttpResponse, env: Record<string, string> = {}, st
     return { value: seen.plan }
   })
   on('session.messages', () => ({ value: [] }))
+  on('session.model', () => ({ value: seen.sessionModel }))
+  on('config.list', () => ({ value: seen.rows }))
+  on('config.set', ($, e) => {
+    seen.configSets.push({ key: e.key, value: e.value })
+    return { value: e.value }
+  })
+  on('command.run', ($, e) => {
+    seen.commands.push(`/${e.command} ${e.args}`)
+    return { text: '' }
+  })
   on('session.usage', () => ({ deny: 'no usage in tests' }))
   on('ui.status', ($, e) => {
     seen.status.push(e.text)
@@ -72,6 +86,7 @@ function world(on: On, reply: HttpResponse, env: Record<string, string> = {}, st
     seen.prompts.push(e.text)
     return { text: e.text }
   })
+  on('turn.complete', ($, e) => ({ text: '' }))
   // Stands for the engine's own drawing of a row the plugin wraps.
   on('ui.render', () => ({ type: 'engine' as const, ref: 0 }))
   on('turn.step', async function* ($, e) {
@@ -486,29 +501,22 @@ describe('the keys pane', () => {
   })
 
   test('the classifier picker changes the /config row', async ($, on) => {
-    world(on, JEV_OK)
-    const set: { key: string; value: unknown }[] = []
-    on('config.list', () => ({
-      value: [
-        {
-          key: 'model-router.provider',
-          label: 'Classifier provider',
-          kind: 'choice' as const,
-          value: 'auto',
-          options: ['auto', 'claude-plan'],
-          provider: { plugin: 'model-router', tier: 'user' as const },
-          isLocked: false,
-        },
-      ],
-    }))
-    on('config.set', ($, e) => {
-      set.push({ key: e.key, value: e.value })
-      return { value: e.value }
-    })
+    const seen = world(on, JEV_OK)
+    seen.rows = [
+      {
+        key: 'model-router.provider',
+        label: 'Classifier provider',
+        kind: 'choice',
+        value: 'auto',
+        options: ['auto', 'claude-plan'],
+        provider: { plugin: 'model-router', tier: 'user' },
+        isLocked: false,
+      },
+    ]
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'vscode', component: 'Pane', requestId: 'router-keys', props: PANE })
     await ui.select({ key: 'provider', value: 'claude-plan' })
 
-    expect(set).toEqual([{ key: 'model-router.provider', value: 'claude-plan' }])
+    expect(seen.configSets).toEqual([{ key: 'model-router.provider', value: 'claude-plan' }])
     await ui.unmount()
   })
 
@@ -517,6 +525,91 @@ describe('the keys pane', () => {
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'mobile', component: 'Pane', requestId: 'router-keys', props: PANE })
 
     expect(await ui.find({ type: 'Text', text: /on your computer/ })).toBeDefined()
+    await ui.unmount()
+  })
+})
+
+describe("the app's model picker follows the pick", () => {
+  test('moves the built-in Model and Effort rows when the session has them', { options: KEY }, async ($, on) => {
+    const seen = world(on, claudeReply(SONNET))
+    seen.rows = [
+      { key: 'model', label: 'Model', kind: 'choice', value: 'opus', options: ['default', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false },
+      { key: 'effortLevel', label: 'Effort', kind: 'choice', value: 'high', options: ['low', 'medium', 'high', 'xhigh', 'max'], provider: { plugin: 'engine', tier: 'core' }, isLocked: false },
+    ]
+    await $.prompt.submit({ text: 'fix the failing test', ...TYPED })
+
+    expect(seen.configSets).toEqual([
+      { key: 'model', value: 'claude-sonnet-5-5' },
+      { key: 'effortLevel', value: 'medium' },
+    ])
+    expect(seen.commands).toEqual([])
+  })
+
+  test('falls back to /model and /effort, and leaves a model already in place alone', { options: KEY }, async ($, on) => {
+    const seen = world(on, claudeReply(SONNET))
+    await $.prompt.submit({ text: 'fix the failing test', ...TYPED })
+    expect(seen.commands).toEqual([])
+    await $.turn.complete({ turnId: 't1', reason: 'answer', answer: '', durationMs: 10, isAborted: false })
+    expect(seen.commands).toEqual(['/model claude-sonnet-5-5', '/effort medium'])
+
+    seen.sessionModel = 'claude-sonnet-5-5[1m]'
+    await $.prompt.submit({ text: 'and the next one', ...TYPED })
+    await $.turn.complete({ turnId: 't2', reason: 'answer', answer: '', durationMs: 10, isAborted: false })
+    expect(seen.commands).toHaveLength(2)
+  })
+
+  test('can be turned off', { options: { ...KEY, syncPicker: false } }, async ($, on) => {
+    const seen = world(on, claudeReply(SONNET))
+    await $.prompt.submit({ text: 'fix the failing test', ...TYPED })
+
+    expect(seen.commands).toEqual([])
+    expect(seen.configSets).toEqual([])
+  })
+})
+
+describe('the band above the prompt', () => {
+  const BAND = {
+    hasSurvey: false,
+    isWorking: false,
+    maxRows: 10,
+    bodyColumns: 100,
+    scroll: { offset: 0, bodyRows: 10 },
+    view: {},
+  }
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    test(`on ${surface}, shows the pick in force and pauses, resumes and opens keys`, { options: KEY }, async ($, on) => {
+      world(on, claudeReply(SONNET))
+      const opened: string[] = []
+      on('ui.open', ($, e) => {
+        opened.push(e.id)
+        return { value: { isPlaced: true as const } }
+      })
+      await $.prompt.submit({ text: 'fix the failing test', ...TYPED })
+      const ui = await $.ui.mount({ plugin: 'model-router', surface, component: 'AbovePrompt', props: BAND })
+
+      const shown = surface === 'desktop' ? String((await ui.find({ type: 'Svg' }))?.props.alt) : (await ui.find({ type: 'Text', text: /Sonnet 5\.5/ }))?.text
+      expect(shown).toContain('Sonnet 5.5')
+
+      await ui.press({ key: 'router-toggle' })
+      const paused = surface === 'desktop' ? String((await ui.find({ type: 'Svg' }))?.props.alt) : (await ui.find({ type: 'Text', text: /Routing paused/ }))?.text
+      expect(paused).toContain('Routing paused')
+      expect((await ui.find({ type: 'Button', key: 'router-toggle' }))?.props.label).toBe('Resume')
+
+      await ui.press({ key: 'router-toggle' })
+      expect((await ui.find({ type: 'Button', key: 'router-toggle' }))?.props.label).toBe('Pause')
+
+      await ui.press({ key: 'router-keys' })
+      expect(opened).toEqual(['router-keys'])
+      await ui.unmount()
+    })
+  }
+
+  test('before the first prompt it says routing is on', async ($, on) => {
+    world(on, claudeReply(SONNET))
+    const ui = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+
+    expect(await ui.find({ type: 'Text', text: /Auto routing/ })).toBeDefined()
     await ui.unmount()
   })
 })

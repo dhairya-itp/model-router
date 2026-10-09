@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, HttpResponse, PromptSubmitInput, Register } from 'claude-code'
 
 import type { RouterCard, RouterKeyCheck, RouterKeySlot, RouterPin, RouterRoute } from '../types'
-import { cardKey, cardSvg, cardView, effortGlyphs, headerSvg } from './card'
+import { bandView, cardKey, cardSvg, cardView, effortGlyphs, headerSvg } from './card'
 import {
   EFFORTS,
   TIERS,
@@ -12,7 +12,9 @@ import {
   classifierModel,
   classifierRequest,
   isOpenRouter,
+  isSameModel,
   modelLabel,
+  pickerOption,
   nearestTier,
   parseInline,
   planRequest,
@@ -301,8 +303,42 @@ async function decide(
   }
 }
 
+/** The effort the app's picker was last moved to by this module, so it is moved only on a change. */
+let syncedEffort: string | undefined
+
+/** Picker moves only a slash command can make, held for the turn's end: a command cannot run inside the prompt's own hook. */
+let pendingCommands: { command: string; args: string }[] = []
+
+/**
+ * Moves the app's own model and effort picker to the route, as the person
+ * would: the built-in /config rows when the session has them, else /model and
+ * /effort. Only on a change, and never fatally: the per-request override in
+ * `turn.step` holds the route either way.
+ */
+async function syncPicker($: EngineInterface, settings: Settings, chosen: RouterRoute): Promise<void> {
+  if (!settings.syncPicker) return
+  try {
+    const rows = (await $.config.list()).filter(row => row.provider.plugin === 'engine')
+    if (!isSameModel(await $.session.model(), chosen.model)) {
+      const row = rows.find(one => one.key === 'model' || /^model$/i.test(one.label))
+      const value = row && pickerOption(row.options, chosen.model, chosen.tier)
+      const set = row && value !== undefined ? await $.config.set({ key: row.key, value }) : undefined
+      if (set === undefined || set.deny !== undefined) pendingCommands.push({ command: 'model', args: chosen.model })
+    }
+    if (syncedEffort !== chosen.effort) {
+      const row = rows.find(one => /effort/i.test(one.key) || /effort/i.test(one.label))
+      const value = row && pickerOption(row.options, chosen.effort)
+      const set = row && value !== undefined ? await $.config.set({ key: row.key, value }) : undefined
+      if (set === undefined || set.deny !== undefined) pendingCommands.push({ command: 'effort', args: chosen.effort })
+      syncedEffort = chosen.effort
+    }
+  } catch {
+    // The picker stays where it was; every request still goes to the route.
+  }
+}
+
 /** Records a decision: the route, the status line, and the card drawn under the prompt. */
-async function apply($: EngineInterface, decision: Decision, text: string): Promise<void> {
+async function apply($: EngineInterface, settings: Settings, decision: Decision, text: string): Promise<void> {
   const seq = await $.clock.now()
   let card: RouterCard
   if ('route' in decision) {
@@ -310,6 +346,7 @@ async function apply($: EngineInterface, decision: Decision, text: string): Prom
     await update($, route, () => chosen)
     await update($, lastError, () => null)
     $.ui.status(statusLine(chosen, false))
+    await syncPicker($, settings, chosen)
     card = { seq, key: cardKey(text), route: chosen }
   } else {
     await update($, lastError, () => decision.error)
@@ -460,6 +497,17 @@ async function chooseProvider($: EngineInterface, value: string): Promise<void> 
   if (row !== undefined) await $.config.set({ key: row.key, value })
 }
 
+/** Pauses or resumes routing, from the command or the band's button. */
+async function setPaused($: EngineInterface, paused: boolean): Promise<void> {
+  await update($, isPaused, () => paused)
+  $.ui.status(statusLine(paused ? null : await read($, route), paused))
+}
+
+async function openKeys($: EngineInterface): Promise<boolean> {
+  const { isPlaced } = await $.ui.open({ id: KEYS_PANE, title: '✻ Model router', focus: true, closeOnEscape: true })
+  return isPlaced
+}
+
 /** Answers `/router <args>`. */
 async function runCommand($: EngineInterface, settings: Settings, args: string): Promise<string> {
   const [verb = '', ...words] = args.trim().split(/\s+/).filter(Boolean)
@@ -476,22 +524,19 @@ async function runCommand($: EngineInterface, settings: Settings, args: string):
     case 'keys':
     case 'key':
     case 'setup': {
-      const { isPlaced } = await $.ui.open({ id: KEYS_PANE, title: '✻ Model router', focus: true, closeOnEscape: true })
-      return isPlaced
+      return (await openKeys($))
         ? '✻ Keys pane open: paste a key and press Enter to save and check it.'
         : '✻ The keys pane opens as soon as there is room for it.'
     }
 
     case 'off':
     case 'pause':
-      await update($, isPaused, () => true)
-      $.ui.status(statusLine(null, true))
+      await setPaused($, true)
       return "Routing is paused. Claude Code's own model setting applies until /router on."
 
     case 'on':
     case 'resume':
-      await update($, isPaused, () => false)
-      $.ui.status(statusLine(await read($, route), false))
+      await setPaused($, false)
       return 'Routing is on. Every prompt gets the model and effort it needs.'
 
     case 'pin': {
@@ -549,7 +594,7 @@ export const register: Register = (on, options) => {
     const pinned = await read($, pin)
     const fixed: InlineChoice = { ...pinned, ...inline?.choice }
     const asked = inline?.rest ?? text
-    await apply($, await decide($, settings, asked, fixed, inline === undefined ? 'pin' : 'inline'), asked)
+    await apply($, settings, await decide($, settings, asked, fixed, inline === undefined ? 'pin' : 'inline'), asked)
 
     return next(inline === undefined ? e : { ...e, text: asked })
   })
@@ -563,6 +608,17 @@ export const register: Register = (on, options) => {
       await update($, cards, list => list.map(card => (card.seq === seq ? { ...card, id: e.uuid } : card)))
     }
     return next(e)
+  })
+
+  // The picker moves that need /model or /effort, once the turn that held them is over.
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && pendingCommands.length > 0) {
+      const commands = pendingCommands
+      pendingCommands = []
+      for (const command of commands) await $.command.run(command).catch(() => undefined)
+    }
+    return result
   })
 
   on('turn.step', async function* ($, e, next) {
@@ -613,6 +669,49 @@ export const register: Register = (on, options) => {
         <Box key={`route-${card.seq}`}>
           <Svg source={art.source} alt={art.alt} width={art.width} height={art.height} isInteractive />
         </Box>
+      </Box>
+    )
+  })
+
+  // Always above the prompt (terminal and desktop): the pick in force, and the controls.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const [chosen, paused, pinned, classifier] = await Promise.all([read($, route), read($, isPaused), read($, pin), resolveClassifier($, settings)])
+    const view = bandView({ route: chosen, isPaused: paused, pin: pinned, classifier: classifierLabel(classifier.settings), isWorking: e.props.isWorking })
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const controls = [
+      <Button key="router-toggle" label={paused ? 'Resume' : 'Pause'} variant={paused ? 'primary' : undefined} onPress={() => void setPaused($, !paused)} />,
+      <Button key="router-keys" label="Keys" onPress={() => void openKeys($)} />,
+      pinned !== null ? <Button key="router-unpin" label="Unpin" onPress={() => void update($, pin, () => null)} /> : null,
+    ]
+
+    if (e.surface === 'desktop') {
+      const { Svg } = $.ui.resolve(e)
+      const art = cardSvg(view, false, 'band')
+      return (
+        <Box key="router-band" flexDirection="row" alignItems="center" gap={1}>
+          <Svg source={art.source} alt={art.alt} width={art.width} height={art.height} isInteractive />
+          {controls}
+        </Box>
+      )
+    }
+
+    const accent = view.tone === 'amber' ? 'warning' : 'claude'
+    const meter = view.effort === undefined ? undefined : effortGlyphs(view.effort)
+    return (
+      <Box key="router-band" flexDirection="row" alignItems="center" gap={1}>
+        <Box borderStyle="round" borderColor={accent} paddingX={1} flexShrink={1}>
+          <Text color={accent} bold>
+            ✻{' '}
+          </Text>
+          <Text bold>{view.title}</Text>
+          {meter && <Text color={accent}>{`  ${meter.lit}`}</Text>}
+          {meter && <Text dimColor>{meter.rest}</Text>}
+          {view.effort && <Text>{` ${view.effort}`}</Text>}
+          {view.tag && <Text color={accent}>{` · ${view.tag}`}</Text>}
+          <Text dimColor wrap="truncate-end">{` · ${view.detail}`}</Text>
+        </Box>
+        {controls}
       </Box>
     )
   })
@@ -729,7 +828,7 @@ export const register: Register = (on, options) => {
   // A model picked with /model while routing runs would be overridden on the next prompt; say so.
   on('command.run', { command: 'model' }, async ($, e, next) => {
     const result = await next(e)
-    if (!(await read($, isPaused)) && e.args.trim() !== '') {
+    if (e.origin.kind !== 'plugin' && !(await read($, isPaused)) && e.args.trim() !== '') {
       $.ui.toast('✻ Each prompt picks its own model. To keep one, use /router pin <model>, or /router off.', { timeoutMs: 8000 })
     }
     return result

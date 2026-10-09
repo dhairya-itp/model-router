@@ -79,6 +79,8 @@ Keys saved this way are stored in the plugin's own file in your Claude Code conf
 
 You don't need to do anything. Every prompt is routed:
 
+- **The band above the chat box** (desktop app and terminal) is always visible. It shows the pick in force, its effort meter, which classifier decided and why, plus **Pause/Resume**, **Keys** and **Unpin** buttons. VS Code doesn't let plugins draw above the prompt, so there you get the card under each prompt instead.
+
 - **The card** under your prompt shows the model, a five-step effort meter, and why. In VS Code or the desktop app, hover the card to see which classifier decided. An amber card means nothing could decide, so the previous pick was kept, and the card says why.
 - **The status line** shows the current pick, for example `✻ Opus 5.5 · high`.
 
@@ -136,6 +138,7 @@ Every setting lives in /config → model-router, except the API key:
 | Fast / Everyday / Deep / Frontier tier model | `claude-haiku-5-5` / `claude-sonnet-5-5` / `claude-opus-5-5` / off |
 | Highest effort allowed | `xhigh` |
 | Show the routing card | on |
+| Move the app's model picker | on: after each pick, Claude Code's own model and effort (the desktop picker, `/model`) are set to it |
 | Classifier timeout (ms) | 6000 |
 
 - **To turn a tier off**, empty its model field. Example: clear the Deep tier to never use Opus.

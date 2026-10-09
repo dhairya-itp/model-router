@@ -23,6 +23,7 @@ export type Settings = {
   models: Readonly<Record<RouterTier, string>>
   maxEffort: RouterEffort
   announce: boolean
+  syncPicker: boolean
   timeoutMs: number
 }
 
@@ -48,6 +49,7 @@ export function readSettings(options: PluginOptions): Settings {
     },
     maxEffort: EFFORTS.includes(maxEffort) ? maxEffort : 'xhigh',
     announce: options.announce !== false,
+    syncPicker: options.syncPicker !== false,
     timeoutMs: Math.min(8000, Math.max(1000, Math.round(timeout))),
   }
 }
@@ -763,4 +765,16 @@ export function parseInline(text: string): { choice: InlineChoice; rest: string 
   }
   const rest = text.slice(match[0].length)
   return rest.trim() === '' ? undefined : { choice, rest }
+}
+
+/** The picker option that names `wanted`: the exact value, else one naming the tier (`opus`), else none. */
+export function pickerOption(options: readonly string[] | undefined, wanted: string, tier?: string): string | undefined {
+  if (options === undefined || options.length === 0) return wanted
+  return options.find(one => one === wanted) ?? (tier === undefined ? undefined : options.find(one => one.toLowerCase().includes(tier)))
+}
+
+/** Whether the session's model (`claude-opus-5-5[1m]`, an alias) is already `model`. */
+export function isSameModel(current: string, model: string): boolean {
+  const bare = current.replace(/\[.*\]$/, '').toLowerCase()
+  return bare === model.toLowerCase() || bare.endsWith(`.${model.toLowerCase()}`)
 }

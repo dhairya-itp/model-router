@@ -1,4 +1,4 @@
-import type { RouterCard, RouterEffort } from '../types'
+import type { RouterCard, RouterEffort, RouterPin, RouterRoute } from '../types'
 import { EFFORTS, modelLabel } from './classify'
 
 /** Claude's accent and its warm highlight; amber when the router could only keep a pick. */
@@ -46,6 +46,43 @@ export function cardView(card: RouterCard): CardView {
     effort: route.effort,
     tag,
     detail: shorten(route.reason, DETAIL_CHARS),
+    tooltip: `${modelLabel(route.model)} (${route.model}) at ${route.effort} effort. Decided by ${route.classifier}: ${route.reason}`,
+  }
+}
+
+/** What the band above the prompt says: the pick in force, routing paused, or the pick to come. */
+export function bandView(input: {
+  route: RouterRoute | null
+  isPaused: boolean
+  pin: RouterPin | null
+  classifier: string
+  isWorking: boolean
+}): CardView {
+  const { route, isPaused, pin, classifier, isWorking } = input
+  if (isPaused) {
+    return {
+      tone: 'amber',
+      title: 'Routing paused',
+      detail: "Claude Code's own model is in use · Resume to route every prompt again",
+      tooltip: 'Routing is paused',
+    }
+  }
+  if (route === null) {
+    return {
+      tone: 'claude',
+      title: 'Auto routing',
+      tag: pin ? 'pinned' : undefined,
+      detail: `${classifier} picks the model and effort for your next prompt`,
+      tooltip: `Every prompt is routed. Classifier: ${classifier}`,
+    }
+  }
+  const tag = pin ? 'pinned' : route.source === 'inline' ? 'your pick' : isWorking ? 'working' : undefined
+  return {
+    tone: 'claude',
+    title: modelLabel(route.model),
+    effort: route.effort,
+    tag,
+    detail: shorten(`by ${route.classifier} · ${route.reason}`, DETAIL_CHARS),
     tooltip: `${modelLabel(route.model)} (${route.model}) at ${route.effort} effort. Decided by ${route.classifier}: ${route.reason}`,
   }
 }
